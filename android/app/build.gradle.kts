@@ -36,20 +36,25 @@ android {
         keyProps.load(FileInputStream(keyPropsFile))
     }
 
+    val hasKeystore = keyProps.containsKey("storeFile") && keyProps.containsKey("storePassword") &&
+                      keyProps.containsKey("keyAlias") && keyProps.containsKey("keyPassword")
+
     signingConfigs {
-        create("release") {
-            storeFile = file(keyProps["storeFile"] ?: "")
-            storePassword = keyProps["storePassword"] as String?
-            keyAlias = keyProps["keyAlias"] as String?
-            keyPassword = keyProps["keyPassword"] as String?
+        if (hasKeystore) {
+            create("release") {
+                storeFile = file(keyProps["storeFile"] as String)
+                storePassword = keyProps["storePassword"] as String
+                keyAlias = keyProps["keyAlias"] as String
+                keyPassword = keyProps["keyPassword"] as String
+            }
         }
     }
 
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            isShrinkResources = false 
-            signingConfig = signingConfigs.getByName("release")
+            isShrinkResources = false
+            signingConfig = if (hasKeystore) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
 
