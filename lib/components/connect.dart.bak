@@ -1,0 +1,880 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+import 'package:Freedom_Guard/core/async_runner.dart';
+import 'package:Freedom_Guard/core/global.dart';
+import 'package:Freedom_Guard/core/network/network_service.dart';
+import 'package:Freedom_Guard/utils/LOGLOG.dart';
+import 'package:Freedom_Guard/components/safe_mode.dart';
+import 'package:Freedom_Guard/components/settings.dart';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_v2ray_client/flutter_v2ray.dart';
+import 'package:http/http.dart' as http;
+
+class ConfigPingResult {
+  final String configLink;
+  final int ping;
+
+  ConfigPingResult({required this.configLink, required this.ping});
+
+  Map<String, dynamic> toJson() => {'configLink': configLink, 'ping': ping};
+
+  factory ConfigPingResult.fromJson(Map<String, dynamic> json) {
+    return ConfigPingResult(configLink: json['configLink'], ping: json['ping']);
+  }
+}
+
+ValueNotifier<V2RayStatus> v2rayStatus = ValueNotifier<V2RayStatus>(
+  V2RayStatus(),
+);
+
+class Connect extends Tools {
+  Timer? _guardModeTimer;
+  bool _guardModeActive = false;
+  final String _cachedConfigsKey = 'cached_config_pings';
+
+  Future<void> _saveConfigPings(List<ConfigPingResult> configs) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      List<String> jsonList =
+          configs.map((c) => jsonEncode(c.toJson())).toList();
+      await prefs.setStringList(_cachedConfigsKey, jsonList);
+      LogOverlay.addLog("Saved ${configs.length} configs with pings to cache.");
+    } catch (e) {
+      LogOverlay.addLog("Error saving config pings: $e");
+    }
+  }
+
+  Future<List<ConfigPingResult>> loadConfigPings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      List<String>? jsonList = prefs.getStringList(_cachedConfigsKey);
+      if (jsonList == null || jsonList.isEmpty) {
+        return [];
+      }
+      return jsonList
+          .map((s) => ConfigPingResult.fromJson(jsonDecode(s)))
+          .toList();
+    } catch (e) {
+      LogOverlay.addLog("Failed to load cached configs: $e");
+      await _clearConfigPings();
+      return [];
+    }
+  }
+
+  Future<void> _clearConfigPings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_cachedConfigsKey);
+    LogOverlay.addLog("Cleared config ping cache.");
+  }
+
+  Future<bool> test() async {
+    try {
+      final response = await http
+          .get(Uri.parse('https://www.google.com'))
+          .timeout(const Duration(seconds: 5));
+      if (response.statusCode == 200) {
+        LogOverlay.showLog("Connected To internet", type: "success");
+        return true;
+      }
+    } catch (_) {}
+    LogOverlay.showLog("No internet", type: "error");
+    return false;
+  }
+
+  Future<void> disConnect({typeDis = "normal"}) async {
+    try {
+      vibeCoreMain.stopV2Ray();
+      if (typeDis != "guard") {
+        _stopGuardModeMonitoring();
+      }
+    } catch (_) {
+      LogOverlay.addLog("Failed to disconnect");
+    }
+  }
+
+  getJson(config) {
+    return V2ray.parseFromURL(config);
+  }
+
+  Future<bool> ConnectVibe(
+    String config,
+    dynamic args, {
+    typeDis = "normal",
+  }) async {
+    await disConnect(typeDis: typeDis);
+    final stopwatch = Stopwatch()..start();
+    GlobalFGB.connStatText.value =
+        "⚡ Applying configuration and preparing connection…";
+
+    LogOverlay.addLog(
+      "Connecting To VIBE...",
+    );
+
+    try {
+      String parser = "";
+      bool requestPermission = await vibeCoreMain.requestPermission();
+      if (!requestPermission) {
+        LogOverlay.showLog("Permission Denied...", type: "error");
+        return false;
+      }
+      if (requestPermission) {
+        try {
+          var parsedConfig = V2ray.parseFromURL(config);
+          parser = parsedConfig != null
+              ? parsedConfig.getFullConfiguration()
+              : config;
+        } catch (_) {
+          parser = config;
+        }
+
+        int ping = -1;
+        try {
+          ping = await vibeCoreMain
+              .getServerDelay(config: parser)
+              .timeout(Duration(seconds: 2), onTimeout: () => -1);
+        } catch (_) {
+          ping = -1;
+        }
+
+        if (ping != -1) {
+          LogOverlay.addLog('Ping connecting $ping ms');
+          GlobalFGB.connStatText.value = "📡 Configuration latency: ${ping} ms";
+        }
+        String parsedJson = await addOptionsToVibe(jsonDecode(parser));
+        if ((await settings.getBool("safe_mode")) == true) {
+          final safeStat = await SafeMode().checkXrayAndConfirm(parsedJson);
+          LogOverlay.addLog("safe mode: " + safeStat.toString());
+          if (!safeStat) {
+            return false;
+          }
+        }
+        if (!(args["type"] is String && args["type"] == "f_link")) {
+          LogOverlay.addLog(parsedJson);
+          SettingsApp().setValue("config_backup", config);
+          LogOverlay.addLog("saved config_backup to " + config);
+        } else {
+          settings.setValue("config_backup", "");
+        }
+
+        vibeCoreMain.startV2Ray(
+          remark: "Freedom Guard",
+          config: parsedJson,
+          blockedApps: (await settings.getValue("split_app"))
+              .toString()
+              .replaceAll("[", "")
+              .replaceAll("]", "")
+              .split(",")
+              .map((e) => e.trim())
+              .where((e) => e.isNotEmpty)
+              .toList(),
+          bypassSubnets: (await getSubNetforBypassVibe()),
+          proxyOnly: (await settings.getBool("proxy_mode")),
+          notificationDisconnectButtonName: "قطع اتصال",
+        );
+        int? proxyPort = jsonDecode(parsedJson)["inbounds"][0]['port'] as int?;
+        await settings.getBool("proxy_mode") == true
+            ? LogOverlay.showLog("Proxy mode enabled on port $proxyPort")
+            : null;
+        _isConnected = true;
+        GlobalFGB.connStatText.value = "Connected successfully ✅";
+        return true;
+      } else {
+        LogOverlay.showLog(
+          "Permission Denied: Please grant necessary permissions to establish a connection.",
+          type: "error",
+        );
+      }
+    } catch (e, stackTrace) {
+      LogOverlay.showLog(
+        "Failed to connect to VIBE \n ${e.toString()}\nStackTrace: ${stackTrace.toString()}",
+        type: "error",
+      );
+      return false;
+    } finally {
+      stopwatch.stop();
+      LogOverlay.addLog(
+          'Connection took ${stopwatch.elapsed.inMilliseconds} ms');
+    }
+
+    return false;
+  }
+
+  Future<bool> ConnectSub(
+    String config,
+    String type, {
+    CancellationToken? token,
+    String typeC = "normal",
+    int depth = 0,
+  }) async {
+    GlobalFGB.connStatText.value = "📥 Fetching subscription configurations…";
+
+    await disConnect();
+    if (depth > 5) {
+      safeLog('Max depth reached');
+      return false;
+    }
+
+    List<ConfigPingResult> cached = await loadConfigPings();
+    bool useCache = (await settings.getValue("selectedServer")) ==
+        (await settings.getValue("saved_sub"));
+
+    await settings.setValue("saved_sub", config);
+
+    if (cached.isNotEmpty && useCache) {
+      GlobalFGB.connStatText.value =
+          "🧠 Using cached configurations (${cached.length} tested)";
+
+      cached.sort((a, b) => a.ping.compareTo(b.ping));
+      for (final c in cached) {
+        if (token?.isCancelled == true) {
+          safeLog('Operation cancelled: ConnectSUB');
+          return false;
+        }
+        safeLog('Trying cached config (${c.ping} ms)');
+        if (await connectAndTest(c.configLink, {"type": type})) {
+          safeLog('Connected via cache');
+          if (await settings.getBool("guard_mode")) {
+            List<String> allConfigs = cached.map((e) => e.configLink).toList();
+            _startGuardModeMonitoring(c.configLink, allConfigs);
+          }
+          return true;
+        }
+      }
+    }
+
+    await _clearConfigPings();
+
+    final response = await NetworkService.get(config);
+    if (response.statusCode != 200) {
+      safeLog('Sub request failed');
+      return false;
+    }
+
+    String raw = response.body.trim();
+    String decoded;
+    try {
+      decoded = utf8.decode(base64Decode(raw));
+    } catch (_) {
+      decoded = raw;
+    }
+
+    List<String> configs =
+        decoded.split('\n').where((e) => e.trim().isNotEmpty).toList();
+
+    List<ConfigPingResult> results = [];
+    int counter = 1;
+    for (final cfg in configs) {
+      GlobalFGB.connStatText.value =
+          "🔍 Testing configuration ${counter} of ${configs.length}…";
+      counter++;
+
+      if (token?.isCancelled == true) {
+        safeLog('Operation cancelled: ConnectSUB');
+        return false;
+      }
+      final ping = await testConfig(cfg, type: typeC);
+      if (ping > 0) {
+        results.add(ConfigPingResult(configLink: cfg, ping: ping));
+        safeLog('Ping OK: $ping ms');
+        if (!_isConnected) {
+          GlobalFGB.connStatText.value =
+              "⚡ Connecting using tested configuration (${ping} ms)…";
+          final result = await connectAndTest(cfg, {});
+          if (!result) {
+            GlobalFGB.connStatText.value =
+                "🔄 Configuration failed. Trying the next one…";
+            await disConnect();
+          }
+          ;
+        }
+      }
+    }
+
+    results.sort((a, b) => a.ping.compareTo(b.ping));
+    await _saveConfigPings(results);
+    GlobalFGB.connStatText.value =
+        "📊 ${results.length} valid configurations found. Connecting…";
+
+    for (final r in results) {
+      GlobalFGB.connStatText.value =
+          "⚡ Connecting using configuration (${r.ping} ms)…";
+
+      if (token?.isCancelled == true) {
+        safeLog('Operation cancelled: ConnectSUB');
+        return false;
+      }
+      safeLog('Connecting (${r.ping} ms)');
+      if (await connectAndTest(r.configLink, {"type": type})) {
+        safeLog('Connected successfully');
+        if (await settings.getBool("guard_mode")) {
+          List<String> allConfigs = results.map((e) => e.configLink).toList();
+          _startGuardModeMonitoring(r.configLink, allConfigs);
+        }
+        return true;
+      }
+    }
+
+    safeLog('All configs failed');
+    GlobalFGB.connStatText.value =
+        "🛑 All configurations were tested. No stable connection found";
+
+    return false;
+  }
+
+  Future<bool> connectAndTest(String cfg, Map args) async {
+    final ok = await ConnectVibe(cfg, args);
+    if (!ok) return false;
+
+    final netResult = await testNet();
+    return netResult['connected'] == true;
+  }
+
+  void _startGuardModeMonitoring(
+    String currentConfig,
+    List<String> allSortedConfigs,
+  ) {
+    _guardModeActive = true;
+    int retryCount = 0;
+    const int maxRetries = 2;
+    String activeConfig = currentConfig;
+
+    _guardModeTimer?.cancel();
+    LogOverlay.addLog("Smart Guard mode monitoring started.");
+
+    Timer(const Duration(seconds: 10), () async {
+      if (!_guardModeActive) return;
+      await _performGuardCheck(
+        allSortedConfigs: allSortedConfigs,
+        activeConfig: activeConfig,
+        retryCount: retryCount,
+        maxRetries: maxRetries,
+        onConfigSwitched: (newConfig) {
+          activeConfig = newConfig;
+          retryCount = 0;
+        },
+        onRetryIncrement: () => retryCount++,
+        onRetryReset: () => retryCount = 0,
+      );
+    });
+
+    _guardModeTimer =
+        Timer.periodic(const Duration(seconds: 120), (timer) async {
+      if (!_guardModeActive) {
+        timer.cancel();
+        return;
+      }
+
+      await _performGuardCheck(
+        allSortedConfigs: allSortedConfigs,
+        activeConfig: activeConfig,
+        retryCount: retryCount,
+        maxRetries: maxRetries,
+        onConfigSwitched: (newConfig) {
+          activeConfig = newConfig;
+          retryCount = 0;
+        },
+        onRetryIncrement: () => retryCount++,
+        onRetryReset: () => retryCount = 0,
+      );
+    });
+  }
+
+  Future<void> _performGuardCheck({
+    required List<String> allSortedConfigs,
+    required String activeConfig,
+    required int retryCount,
+    required int maxRetries,
+    required void Function(String) onConfigSwitched,
+    required VoidCallback onRetryIncrement,
+    required VoidCallback onRetryReset,
+  }) async {
+    int ping = await getConnectedDelay();
+    LogOverlay.addLog("Guard mode check - ping: $ping");
+
+    if (ping == -1 || ping > 1000) {
+      onRetryIncrement();
+      LogOverlay.addLog(
+          "Guard mode: bad connection, retry $retryCount/$maxRetries");
+
+      if (retryCount >= maxRetries) {
+        LogOverlay.addLog("Guard mode: attempting to find next best config.");
+        bool connected = false;
+
+        for (String nextCfg in allSortedConfigs) {
+          if (nextCfg == activeConfig) continue;
+
+          LogOverlay.addLog("Guard mode: testing next config...");
+          int newPing = await testConfig(nextCfg);
+
+          if (newPing != -1 && newPing < 1000) {
+            LogOverlay.addLog(
+                "Guard mode: trying better config with ping $newPing");
+            bool result = await ConnectVibe(nextCfg, {}, typeDis: "guard");
+            if (result) {
+              final netResult = await testNet();
+              if (netResult['connected']) {
+                onConfigSwitched(nextCfg);
+                connected = true;
+                LogOverlay.showLog("Guard mode: switched to new config",
+                    type: "success");
+                break;
+              } else {
+                await disConnect(typeDis: "guard");
+              }
+            }
+          }
+        }
+
+        if (!connected) {
+          LogOverlay.addLog(
+              "Guard mode: no better config found after checking all.");
+        }
+      }
+    } else {
+      onRetryReset();
+      LogOverlay.addLog("Guard mode: connection healthy");
+    }
+  }
+
+  void _stopGuardModeMonitoring() {
+    _guardModeActive = false;
+    _guardModeTimer?.cancel();
+    _guardModeTimer = null;
+  }
+
+  Future<bool> ConnectFG(String fgconfig, int timeout,
+      {CancellationToken? token}) async {
+    try {
+      GlobalFGB.connStatText.value = "Connecting to Repo Mode...";
+
+      final uri = fgconfig;
+      http.Response? response;
+      int delayMs = 800;
+      bool usedCache = false;
+      String? cachedData;
+
+      try {
+        response = await NetworkService.get(uri).timeout(
+          Duration(milliseconds: timeout),
+        );
+      } catch (e) {
+        final prefs = await SharedPreferences.getInstance();
+        cachedData = prefs.getString('cached_fg_config');
+        if (cachedData != null) {
+          usedCache = true;
+          safeLog('Using cached config');
+        } else {
+          safeLog('No cached config available');
+          return false;
+        }
+
+        await Future.delayed(Duration(milliseconds: delayMs));
+        delayMs *= 2;
+      }
+
+      dynamic data;
+      if (usedCache) {
+        data = jsonDecode(cachedData!);
+      } else {
+        if (response == null || response.statusCode != 200) {
+          safeLog('Failed to load config');
+          return false;
+        }
+        data = jsonDecode(response.body);
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('cached_fg_config', response.body);
+      }
+
+      List publicServers = data["MOBILE"];
+      List<String> allConfigs = [];
+      for (var entry in publicServers) {
+        if (token!.isCancelled) {
+          safeLog('Operation cancelled: ConnectFG');
+          return false;
+        }
+        var parts = entry.split(",;,");
+        if (parts[0] == "vibe") {
+          var config = parts[1].split("#")[0];
+          if (config.startsWith("http") || config.startsWith("freedom-guard")) {
+            String subUrl = config.replaceAll("freedom-guard://", "");
+            try {
+              GlobalFGB.connStatText.value =
+                  "📥 Repository contains subscription. Processing it…";
+
+              final bool? connected = await PromiseRunner.runWithTimeout<bool>(
+                (token) => connect.ConnectSub(
+                  config,
+                  "f_link",
+                  token: token,
+                ),
+                timeout: Duration(seconds: 60),
+              );
+
+              final result = connected == true || _isConnected;
+
+              if (result == true) return true;
+              GlobalFGB.connStatText.value = "🔄 Trying the next subscription…";
+            } catch (_) {}
+          } else {
+            allConfigs.add(config);
+          }
+        }
+      }
+
+      List<ConfigPingResult> results = [];
+      for (final cfg in allConfigs) {
+        final ping = await testConfig(cfg);
+        if (ping > 0) {
+          results.add(ConfigPingResult(configLink: cfg, ping: ping));
+          safeLog('Ping OK: $ping ms');
+        }
+      }
+
+      results.sort((a, b) => a.ping.compareTo(b.ping));
+      if (results.isEmpty) {
+        safeLog('No valid configs');
+        return false;
+      }
+
+      for (final r in results) {
+        safeLog('Connecting (${r.ping} ms)');
+        if (await connectAndTest(r.configLink, {"type": "fgAuto"})) {
+          safeLog('Connected successfully');
+          if (await settings.getBool("guard_mode")) {
+            List<String> allSortedConfigs =
+                results.map((e) => e.configLink).toList();
+            _startGuardModeMonitoring(r.configLink, allSortedConfigs);
+          }
+          return true;
+        }
+      }
+
+      safeLog('All configs failed');
+      return false;
+    } catch (e) {
+      safeLog(e.toString());
+      return false;
+    }
+  }
+}
+
+class Tools {
+  bool _isConnected = false;
+  bool get isConnected => _isConnected;
+  SettingsApp settings = new SettingsApp();
+  late final V2ray vibeCoreMain;
+
+  Tools() {
+    vibeCoreMain = V2ray(
+      onStatusChanged: (status) {
+        v2rayStatus.value = status;
+        _isConnected = status.state == "CONNECTED";
+      },
+    );
+    _initializeV2RayOnce();
+  }
+  Future<void> _initializeV2RayOnce() async {
+    try {
+      await vibeCoreMain.initialize();
+    } catch (e, stackTrace) {
+      _log(
+        "خطا در مقداردهی اولیه VIBE: $e\nStackTrace: $stackTrace",
+        type: "add",
+      );
+    }
+  }
+
+  void _log(dynamic message, {String type = "info"}) {
+    if (type == "add") {
+      LogOverlay.addLog(message.toString());
+      return;
+    }
+    LogOverlay.showLog(message.toString(), type: type);
+    debugPrint(message.toString());
+  }
+
+  bool isBase64(String str) {
+    final base64RegExp = RegExp(r'^[A-Za-z0-9+/]+={0,2}$');
+    str = str.replaceAll('\n', '').replaceAll('\r', '');
+    return str.length % 4 == 0 && base64RegExp.hasMatch(str);
+  }
+
+  debugPrint(message) {
+    LogOverlay.addLog(message);
+  }
+
+  void safeLog(String message, {SendPort? port}) {
+    LogOverlay.addLog(message);
+  }
+
+  Future<int> getConnectedDelay() async {
+    return await vibeCoreMain.getConnectedServerDelay().timeout(
+      Duration(seconds: 7),
+      onTimeout: () {
+        return -1;
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> testNet() async {
+    final attempts = 3;
+    int successDelay = -1;
+    await Future.delayed(Duration(seconds: 2));
+
+    for (int i = 0; i < attempts; i++) {
+      final isLastAttempt = (i == attempts - 1);
+      final timeoutSeconds = isLastAttempt ? 6 : 3;
+
+      final stopwatch = Stopwatch()..start();
+
+      try {
+        final response = await http
+            .get(Uri.parse('https://www.google.com/generate_204'))
+            .timeout(Duration(seconds: timeoutSeconds));
+
+        stopwatch.stop();
+
+        LogOverlay.addLog(
+            "Ping attempt ${i + 1} → ${stopwatch.elapsedMilliseconds} ms | Status: ${response.statusCode}");
+
+        if (response.statusCode == 204) {
+          successDelay = stopwatch.elapsedMilliseconds;
+          break;
+        }
+      } on SocketException {
+        LogOverlay.addLog("Ping attempt ${i + 1} → No Internet");
+      } on TimeoutException {
+        LogOverlay.addLog(
+            "Ping attempt ${i + 1} → Timeout after ${timeoutSeconds}s");
+      } catch (e) {
+        LogOverlay.addLog("Ping attempt ${i + 1} → Error: $e");
+      }
+    }
+
+    if (successDelay >= 0) {
+      return {
+        'connected': true,
+        'delay_ms': successDelay,
+      };
+    }
+
+    return {
+      'connected': false,
+      'delay_ms': null,
+      'error': 'Failed after $attempts attempts',
+    };
+  }
+
+  Future<String> addOptionsToVibe(dynamic parsedJson) async {
+    final settingsValues = await Future.wait([
+      settings.getValue("mux"),
+      settings.getValue("fragment"),
+      settings.getValue("bypass_iran"),
+      settings.getBool("child_lock_enabled"),
+      settings.getValue("block_ads_trackers"),
+      settings.getList("preferred_dns"),
+      settings.getValue("fakedns"),
+      settings.getValue("sni"),
+    ]);
+
+    String mux = settingsValues[0] as String;
+    String fragment = settingsValues[1] as String;
+    String bypassIran = settingsValues[2] as String;
+    bool childLock = settingsValues[3] as bool;
+    String blockTADS = settingsValues[4] as String;
+    List dnsServers = settingsValues[5] as List;
+    String fakeDns = settingsValues[6] as String;
+    String sni = settingsValues[7] as String;
+
+    if (parsedJson is Map<String, dynamic>) {
+      parsedJson["outbounds"] ??= [];
+      parsedJson["routing"] ??= {};
+      parsedJson["routing"]["rules"] ??= [];
+      parsedJson["outbounds"].add({
+        "protocol": "blackhole",
+        "tag": "blockedrule",
+        "settings": {
+          "response": {"type": "http"},
+        },
+      });
+
+      parsedJson["dns"] ??= {};
+      parsedJson["dns"]["servers"] ??= [];
+
+      if (dnsServers.isNotEmpty) {
+        parsedJson["dns"]["servers"] = dnsServers;
+      }
+
+      if (bypassIran == "true") {
+        (parsedJson["routing"]["rules"] as List).add({
+          "type": "field",
+          "ip": ["geoip:ir"],
+          "outboundTag": "direct",
+        });
+      }
+
+      if (childLock) {
+        parsedJson["routing"]["rules"].add({
+          "type": "field",
+          "domain": ["geosite:category-adult"],
+          "outboundTag": "blockedrule",
+        });
+      }
+
+      if (blockTADS == "true") {
+        (parsedJson["routing"]["rules"] as List).add({
+          "type": "field",
+          "domain": [
+            "geosite:category-ads-all",
+            "geosite:category-public-tracker",
+          ],
+          "outboundTag": "blockedrule",
+        });
+      }
+
+      if (mux.trim().isNotEmpty) {
+        try {
+          final muxJson = json.decode(mux);
+          if (muxJson is Map && muxJson["enabled"] == true) {
+            for (var outbound in parsedJson["outbounds"]) {
+              if (outbound is Map<String, dynamic>) {
+                final protocol = outbound["protocol"];
+                if (protocol != 'freedom' &&
+                    protocol != 'blackhole' &&
+                    protocol != 'direct') {
+                  outbound["mux"] = muxJson;
+                }
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (fragment.trim().isNotEmpty) {
+        try {
+          final fragJson = json.decode(fragment);
+          if (fragJson is Map && fragJson["enabled"] == true) {
+            for (var outbound in parsedJson["outbounds"]) {
+              if (outbound is Map<String, dynamic>) {
+                final protocol = outbound["protocol"];
+                if (protocol != 'freedom' &&
+                    protocol != 'blackhole' &&
+                    protocol != 'direct') {
+                  outbound["settings"] ??= {};
+                  (outbound["settings"] as Map<String, dynamic>)["fragment"] =
+                      fragJson;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          LogOverlay.addLog("Error applying fragment: $e");
+        }
+      }
+
+      if (fakeDns.trim().isNotEmpty) {
+        try {
+          final fakeJson = json.decode(fakeDns);
+          if (fakeJson is Map && fakeJson["enabled"] == true) {
+            parsedJson["fakedns"] = [
+              {"ipPool": fakeJson["ipPool"], "poolSize": fakeJson["lruSize"]},
+            ];
+            (parsedJson["dns"]["servers"] as List).insert(0, "fakedns");
+          }
+        } catch (e) {}
+      }
+      if (sni.trim().isNotEmpty) {
+        try {
+          final sniJson = jsonDecode(sni);
+          if (sniJson is Map &&
+              sniJson["enabled"] == true &&
+              sniJson["serverName"] != null &&
+              sniJson["serverName"].toString().isNotEmpty) {
+            for (var outbound in parsedJson["outbounds"]) {
+              if (outbound is Map<String, dynamic>) {
+                final stream = outbound["streamSettings"];
+                if (stream is Map<String, dynamic>) {
+                  final security = stream["security"];
+
+                  if (security == "tls") {
+                    stream["tlsSettings"] ??= {};
+                    stream["tlsSettings"]["serverName"] = sniJson["serverName"];
+                  }
+
+                  if (security == "reality") {
+                    stream["realitySettings"] ??= {};
+                    stream["realitySettings"]["serverName"] =
+                        sniJson["serverName"];
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          LogOverlay.addLog("SNI apply failed: $e");
+        }
+      }
+    }
+    return jsonEncode(parsedJson);
+  }
+
+  Future<int> testConfig(String config, {String type = "normal"}) async {
+    try {
+      String parser = "";
+      try {
+        var parsedConfig = V2ray.parseFromURL(config);
+        parser =
+            parsedConfig != null ? parsedConfig.getFullConfiguration() : config;
+      } catch (_) {
+        parser = config;
+      }
+      final ping = await vibeCoreMain.getServerDelay(config: parser).timeout(
+        const Duration(seconds: 6),
+        onTimeout: () {
+          type != "f_link"
+              ? debugPrint('Ping timeout for config: $config')
+              : null;
+          return -1;
+        },
+      );
+      if (ping > 0) {
+        return ping;
+      } else {
+        type != "f_link"
+            ? debugPrint('Invalid ping ($ping) for config: $config')
+            : null;
+        return -1;
+      }
+    } catch (e) {
+      type != "f_link"
+          ? debugPrint(
+              'Error for config: $config\nError: $e\nStackTrace: in parse config',
+            )
+          : null;
+      return -1;
+    }
+  }
+
+  Future<bool> isConfigValid(String config) async {
+    return await testConfig(config) > 0;
+  }
+
+  Future<dynamic> getSubNetforBypassVibe() async {
+    if (await settings.getValue("bypass_lan") == "true") {
+      LogOverlay.showLog("Bypass LAN Enabled");
+      return [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "fc00::/7",
+      ];
+    } else {
+      return null;
+    }
+  }
+}
